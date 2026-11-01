@@ -53,6 +53,7 @@ def get_certificate_info(hostname, port, timeout=10):
         with socket.create_connection((hostname, port), timeout=timeout) as sock:
             with context.wrap_socket(sock, server_hostname=hostname) as ssock:
                 cert_bin = ssock.getpeercert(binary_form=True)
+                # With verification switched off above, this call returns an empty dictionary on most builds, so the SAN and CN lookups below that read from cert_dict usually find nothing. The cryptography based fallback further down is not a belt and braces extra; on an unverified connection it is the path that actually produces the name list.
                 cert_dict = ssock.getpeercert()
                 if not cert_bin:
                     logging.warning("No certificate found.")
@@ -113,6 +114,7 @@ def get_certificate_info(hostname, port, timeout=10):
                     "subject": subject,
                     "not_valid_before": not_valid_before,
                     "not_valid_after": not_valid_after,
+                    # I decide self signed by string equality of the two RFC4514 renderings. A root CA certificate satisfies that by design, and so does any certificate whose issuer happens to render identically, while a self signed certificate whose subject and issuer order their fields differently slips past.
                     "self_signed": issuer == subject,
                     "expired": (na is not None and na < now),
                     "not_yet_valid": (nb is not None and nb > now),
@@ -153,6 +155,7 @@ def check_weak_ciphers(hostname, port, timeout=10):
         conn = None
         sock = None
         try:
+            # Every weak suite is offered inside a TLS 1.2 shaped context, so a suite a server only negotiates under an older protocol version is never offered in its native setting. My list is also six names long and frozen: anything weak that is not on it is not tested, whatever the server supports.
             context = SSL.Context(SSL.TLSv1_2_METHOD)
             try:
                 context.set_cipher_list(suite.encode())
@@ -253,6 +256,7 @@ def main():
             logging.error(f"Invalid target URL: {target}")
             sys.exit(1)
     else:
+        # A target written as a bare host with a path, example.com/login with no scheme, lands here whole, path included, and is handed to DNS as a hostname. The URL branch above only triggers when a scheme made urlparse fill in netloc.
         target_hostname = target
         port = args.port
 
