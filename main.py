@@ -30,6 +30,26 @@ def setup_argparse():
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose output for debugging.')
     return parser
 
+def _is_self_signed(x509_cert, issuer, subject):
+    """True only when the certificate was signed with its own key.
+
+    Uses signature verification (verify_directly_issued_by, cryptography
+    42 and newer) when available: a certificate whose issuer string
+    merely equals its subject string, such as a CA issued leaf that
+    shares the CA name, is not self signed. On older cryptography
+    versions without that method, falls back to issuer and subject
+    string equality.
+    """
+    verify = getattr(x509_cert, "verify_directly_issued_by", None)
+    if callable(verify):
+        try:
+            verify(x509_cert)
+            return True
+        except Exception:
+            return False
+    return issuer == subject
+
+
 def _as_utc(dt):
     if dt is None:
         return None
@@ -114,8 +134,7 @@ def get_certificate_info(hostname, port, timeout=10):
                     "subject": subject,
                     "not_valid_before": not_valid_before,
                     "not_valid_after": not_valid_after,
-                    # I decide self signed by string equality of the two RFC4514 renderings. A root CA certificate satisfies that by design, and so does any certificate whose issuer happens to render identically, while a self signed certificate whose subject and issuer order their fields differently slips past.
-                    "self_signed": issuer == subject,
+                    "self_signed": _is_self_signed(x509_cert, issuer, subject),
                     "expired": (na is not None and na < now),
                     "not_yet_valid": (nb is not None and nb > now),
                     "hostname_mismatch": hostname_mismatch,
@@ -149,52 +168,67 @@ def check_weak_ciphers(hostname, port, timeout=10):
     as not completed, so an unreachable target is never reported clean.
     The connection is closed on every path.
     """
+    # Each suite is offered under TLS 1.2, then TLS 1.1, then TLS 1.0
+    # shaped contexts, because several suites in the list were only ever
+    # negotiable under older protocol versions. The list itself covers
+    # the six named suites below; a weak suite outside the list is not
+    # tested.
+    methods = [m for m in (getattr(SSL, "TLSv1_2_METHOD", None),
+                           getattr(SSL, "TLSv1_1_METHOD", None),
+                           getattr(SSL, "TLSv1_METHOD", None)) if m is not None]
     found = []
     completed = 0
     for suite in WEAK_CIPHERS:
-        conn = None
-        sock = None
-        try:
-            # Every weak suite is offered inside a TLS 1.2 shaped context, so a suite a server only negotiates under an older protocol version is never offered in its native setting. My list is also six names long and frozen: anything weak that is not on it is not tested, whatever the server supports.
-            context = SSL.Context(SSL.TLSv1_2_METHOD)
+        suite_completed = False
+        for method in methods:
+            conn = None
+            sock = None
             try:
-                context.set_cipher_list(suite.encode())
-            except Exception:
-                # The local TLS library does not know this suite name at
-                # all; that attempt cannot test the server, so skip it.
-                continue
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(timeout)
-            conn = SSL.Connection(context, sock)
-            conn.connect((hostname, port))
-            try:
-                conn.do_handshake()
-            except SSL.Error:
-                completed += 1
-                continue
+                context = SSL.Context(method)
+                try:
+                    context.set_cipher_list(suite.encode())
+                except Exception:
+                    # The local TLS library does not know this suite name
+                    # at all; no method context can test it, so skip the
+                    # suite entirely.
+                    break
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                conn = SSL.Connection(context, sock)
+                conn.connect((hostname, port))
+                try:
+                    conn.do_handshake()
+                except SSL.Error:
+                    suite_completed = True
+                    continue
+                suite_completed = True
+                name = conn.get_cipher_name()
+                logging.warning(f"Weak cipher accepted by server: {name or suite}")
+                found.append(name or suite)
+                break
+            except (socket.timeout, socket.gaierror, OSError) as e:
+                logging.error(f"Weak cipher check could not reach {hostname}:{port}: {e}")
+                break
+            except Exception as e:
+                logging.error(f"An unexpected error occurred: {e}")
+                break
+            finally:
+                if conn is not None:
+                    try:
+                        conn.shutdown()
+                    except Exception:
+                        pass
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                elif sock is not None:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+        if suite_completed:
             completed += 1
-            name = conn.get_cipher_name()
-            logging.warning(f"Weak cipher accepted by server: {name or suite}")
-            found.append(name or suite)
-        except (socket.timeout, socket.gaierror, OSError) as e:
-            logging.error(f"Weak cipher check could not reach {hostname}:{port}: {e}")
-        except Exception as e:
-            logging.error(f"An unexpected error occurred: {e}")
-        finally:
-            if conn is not None:
-                try:
-                    conn.shutdown()
-                except Exception:
-                    pass
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            elif sock is not None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
     return found, completed
 
 def check_tls_version(hostname, port, timeout=10):
@@ -256,9 +290,23 @@ def main():
             logging.error(f"Invalid target URL: {target}")
             sys.exit(1)
     else:
-        # A target written as a bare host with a path, example.com/login with no scheme, lands here whole, path included, and is handed to DNS as a hostname. The URL branch above only triggers when a scheme made urlparse fill in netloc.
-        target_hostname = target
-        port = args.port
+        # Bare target without a scheme: keep only the host (and an
+        # explicit port when written as host:port); a path or query
+        # suffix such as example.com/login is not part of the hostname.
+        hostport = target.split("/")[0].split("?")[0].split("#")[0]
+        if hostport.startswith("[") and "]" in hostport:
+            target_hostname = hostport[1:hostport.index("]")]
+            rest = hostport[hostport.index("]") + 1:]
+            port = int(rest[1:]) if rest.startswith(":") and rest[1:].isdigit() else args.port
+        elif hostport.count(":") == 1 and hostport.rsplit(":", 1)[1].isdigit():
+            target_hostname, port_text = hostport.rsplit(":", 1)
+            port = int(port_text)
+        else:
+            target_hostname = hostport
+            port = args.port
+        if not target_hostname:
+            logging.error(f"Invalid target: {target}")
+            sys.exit(1)
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
